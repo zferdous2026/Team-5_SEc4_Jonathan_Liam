@@ -1,0 +1,1026 @@
+---
+title: "Capstone Project"
+author: "Liam Kelso and Jonathan French"
+date: "2026-11-06"
+output: html_document
+---
+
+#Load Data
+
+```{r}
+water_quality <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20/water_quality.csv')
+
+weather <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20/weather.csv')
+
+r <- water_quality <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20/water_quality.csv')
+write.csv(r,file = "my_saved_data.csv", row.names = FALSE)
+
+x <- weather <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20/weather.csv')
+write.csv(x, "my_saved_data.csv_weather", row.names = FALSE)
+          
+head(water_quality)
+head(weather)
+
+tail(water_quality)
+tail(weather)
+
+```
+
+---
+title: "Safe to Swim? Sydney Beach Water Quality"
+subtitle: "Where water is unsafe, how fast it recovers after rain, and whether it's getting better"
+author: "Liam Kelso and Jonathan French"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5,
+                      fig.align = "center")
+```
+
+> **How to use this file:** open it in RStudio and click **Knit**. You get a web page with every
+> graph, table, and an explanation under each one. Click the **Code** buttons to see the R code.
+
+# Our research questions
+
+1. **Which beaches are unsafe most often, and is enclosed harbour water worse than the open ocean?**
+2. **After heavy rain, how many days until the water is safe again?**
+3. **Has water quality improved since the 1990s, and are recent wetter years undoing that progress?**
+
+**Key definitions used throughout:**
+
+- A sample is **unsafe** if enterococci (fecal bacteria) is **41 or more cfu per 100 mL**.
+- A **heavy rain day** has **20 mm or more** of rain.
+- **Dry weather** means less than 1 mm of rain in the previous 3 days.
+- Every site is one of three **site types**:
+  - **Ocean:** open-coast beaches.
+  - **Harbour:** enclosed Sydney Harbour sites.
+  - **River/lake:** inland Western Sydney swim spots.
+
+# 1. Setup
+
+## Packages and settings
+
+```{r packages}
+library(tidyverse)   # data wrangling + ggplot2
+library(scales)      # percent() and comma() labels
+library(broom)       # tidy() turns model output into a table
+library(knitr)       # kable() prints nice tables
+
+theme_set(theme_minimal(base_size = 13))
+
+# Same colors for site types in every figure
+type_colors    <- c("Ocean" = "#0E7C86", "Harbour" = "#E4572E", "River/lake" = "#7A5C99")
+weather_colors <- c("Dry weather" = "#F2C14E", "Wet weather" = "#0B2545")
+
+# Thresholds
+SAFE_LIMIT <- 41   # cfu/100 mL; at or above = unsafe
+HEAVY_RAIN <- 20   # mm in one day = heavy rain day
+DRY_LIMIT  <- 1    # under this many mm over 3 days = dry weather
+
+# 5-year periods used in Question 3
+PERIOD_BREAKS <- c(1990, 1995, 2000, 2005, 2010, 2015, 2020, 2025)
+PERIOD_LABELS <- c("1991-95", "1996-00", "2001-05", "2006-10", "2011-15", "2016-20", "2021-25")
+```
+
+## Helper functions
+
+We do these things many times, so we write each one once.
+
+```{r helpers}
+# For any grouping: how many samples, how many unsafe, and the percent unsafe
+unsafe_summary <- function(df, ...) {
+  df %>%
+    group_by(...) %>%
+    summarise(
+      samples    = n(),
+      n_unsafe   = sum(unsafe),
+      pct_unsafe = mean(unsafe),            # mean of TRUE/FALSE = proportion TRUE
+      median_bac = median(enterococci_cfu_100ml),
+      .groups = "drop"
+    )
+}
+
+# For each day: how many days since the last day with at least `threshold` mm of rain
+# (assumes the dates are already sorted)
+days_since_rain <- function(dates, rain, threshold) {
+  tibble(date = dates, rain = rain) %>%
+    mutate(last_rain_day = if_else(rain >= threshold, date, as.Date(NA))) %>%
+    fill(last_rain_day) %>%                 # copy the last rain date down to later days
+    mutate(days = as.numeric(date - last_rain_day)) %>%
+    pull(days)
+}
+
+# Group days-since-rain into readable bins for plotting
+bin_days <- function(d) {
+  case_when(
+    d == 0  ~ "Rain day",
+    d <= 4  ~ as.character(d),
+    d <= 7  ~ "5-7",
+    d <= 14 ~ "8-14",
+    TRUE    ~ "15+"
+  ) %>%
+    factor(levels = c("Rain day", "1", "2", "3", "4", "5-7", "8-14", "15+"))
+}
+
+# Turn a logistic regression into a readable table of odds ratios
+odds_table <- function(model) {
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    transmute(Term         = term,
+              `Odds ratio` = round(estimate, 2),
+              `95% CI`     = paste0(round(conf.low, 2), "-", round(conf.high, 2)),
+              `p-value`    = signif(p.value, 2))
+}
+```
+
+# 2. Load and inspect the data
+
+```{r load}
+base_url <- "https://raw.githubusercontent.com/rfordatascience/tidytuesday/main/data/2025/2025-05-20/"
+water_raw   <- read_csv(paste0(base_url, "water_quality.csv"))
+weather_raw <- read_csv(paste0(base_url, "weather.csv"))
+
+glimpse(water_raw)
+glimpse(weather_raw)
+```
+
+**What we have:**
+
+- **Water quality table:** `r comma(nrow(water_raw))` rows and `r ncol(water_raw)` columns. Each row is one water sample at one swim site on one date.
+- **Weather table:** `r comma(nrow(weather_raw))` rows and `r ncol(weather_raw)` columns. Each row is one day of Sydney weather.
+
+## Variable ranges
+
+```{r ranges}
+# Min, median, max, and number missing for every numeric column
+water_raw %>%
+  select(where(is.numeric)) %>%
+  summary()
+
+# How many different regions, councils, and swim sites there are
+water_raw %>%
+  summarise(regions  = n_distinct(region),
+            councils = n_distinct(council),
+            sites    = n_distinct(swim_site)) %>%
+  kable(caption = "Number of distinct values in categorical variables")
+```
+
+**What we're seeing:**
+
+- **Huge range in bacteria:** from 0 to over 1 million cfu, so we'll use a log scale.
+- **Impossible water temperatures:** some readings are above 40 °C, which can't happen in Sydney's ocean.
+- **Missing data:** temperature and conductivity are missing in most rows.
+
+## Missing values
+
+```{r missing}
+# colMeans(is.na(...)) gives the share of missing values in each column
+missing <- tibble(variable    = names(water_raw),
+                  pct_missing = colMeans(is.na(water_raw)))
+
+ggplot(missing, aes(pct_missing, reorder(variable, pct_missing))) +
+  geom_col(fill = "#0E7C86") +
+  scale_x_continuous(labels = percent) +
+  labs(title = "Missing values by column", x = "Percent missing", y = NULL)
+```
+
+**What this shows:**
+
+- **Mostly missing:** conductivity and water temperature are missing in over 60% of samples, so we don't build our main analysis on them.
+- **Nearly complete:** the bacteria measurement, our main outcome, is almost never missing.
+
+## Sampling effort over time
+
+```{r sampling-effort}
+water_raw %>%
+  mutate(year = year(date)) %>%
+  count(year, region) %>%
+  ggplot(aes(year, n, fill = region)) +
+  geom_col() +
+  labs(title = "Number of samples collected each year, by region",
+       x = NULL, y = "Samples", fill = "Region")
+```
+
+**What this shows:** the number of samples changes a lot over time.
+
+- **Before about 1995:** almost all samples are from ocean beaches.
+- **Mid-1990s:** Sydney Harbour sampling ramps up.
+- **After 2011:** the Western Sydney river sites appear.
+
+This matters for Question 3, because changes in *which* sites were sampled could look like changes in water quality. We handle this in Section 7.
+
+# 3. Clean the data
+
+```{r clean}
+rows_before <- nrow(water_raw)
+
+water <- water_raw %>%
+  distinct() %>%                                  # remove duplicate rows
+  filter(!is.na(enterococci_cfu_100ml)) %>%       # remove rows with no bacteria value
+  mutate(
+    date   = as_date(date),
+    year   = year(date),
+    month  = month(date, label = TRUE),
+    decade = (year - 2000) / 10,                  # for models: 1 unit = 10 years
+    period = cut(year, breaks = PERIOD_BREAKS, labels = PERIOD_LABELS),
+
+    # Southern hemisphere seasons
+    season = case_when(
+      month(date) %in% c(12, 1, 2) ~ "Summer",
+      month(date) %in% c(3, 4, 5)  ~ "Autumn",
+      month(date) %in% c(6, 7, 8)  ~ "Winter",
+      TRUE                         ~ "Spring"
+    ),
+    season = factor(season, levels = c("Summer", "Autumn", "Winter", "Spring")),
+
+    # Temperatures outside 5-35 °C are impossible, so set them to NA
+    water_temperature_c = if_else(between(water_temperature_c, 5, 35),
+                                  water_temperature_c, NA),
+
+    # Three site types
+    site_type = case_when(
+      region == "Sydney Harbour" ~ "Harbour",
+      region == "Western Sydney" ~ "River/lake",
+      TRUE                       ~ "Ocean"
+    ),
+    site_type = factor(site_type, levels = c("Ocean", "Harbour", "River/lake")),
+
+    unsafe       = enterococci_cfu_100ml >= SAFE_LIMIT,   # TRUE / FALSE
+    log_bacteria = log10(enterococci_cfu_100ml + 1)       # +1 so a count of 0 still works
+  )
+
+cat("Rows before cleaning:", comma(rows_before), "\n")
+cat("Rows after cleaning: ", comma(nrow(water)), "\n")
+```
+
+## Weather features
+
+```{r weather}
+weather <- weather_raw %>%
+  mutate(date = as_date(date)) %>%
+  arrange(date) %>%
+  mutate(
+    # Rain today + yesterday + the day before
+    rain_3day = precipitation_mm + lag(precipitation_mm, 1) + lag(precipitation_mm, 2),
+    # Days since the last heavy rain (20 mm), plus 10 mm and 40 mm versions for a check later
+    days_since_heavy = days_since_rain(date, precipitation_mm, HEAVY_RAIN),
+    days_since_10mm  = days_since_rain(date, precipitation_mm, 10),
+    days_since_40mm  = days_since_rain(date, precipitation_mm, 40)
+  ) %>%
+  select(date, precipitation_mm, rain_3day, days_since_heavy, days_since_10mm, days_since_40mm)
+
+summary(select(weather, precipitation_mm, rain_3day, days_since_heavy))
+```
+
+```{r annual-rain}
+# Rain totals per year (we reuse this table in Question 3)
+yearly_rain <- weather %>%
+  mutate(year = year(date)) %>%
+  filter(year < 2025) %>%                       # 2025 is a partial year
+  group_by(year) %>%
+  summarise(total_rain = sum(precipitation_mm),
+            heavy_days = sum(precipitation_mm >= HEAVY_RAIN))
+
+ggplot(yearly_rain, aes(year, total_rain)) +
+  geom_col(fill = "#0B2545") +
+  labs(title = "Total rainfall each year",
+       x = NULL, y = "Total rain (mm)")
+```
+
+**What this shows:** rainfall varies a lot from year to year, and **recent years (around 2020–2024) are some of the wettest** in the record. This is why Question 3 asks whether wetter years could be undoing progress.
+
+## Join water and weather
+
+```{r join}
+# Add the weather for each sample's date
+beach <- water %>%
+  left_join(weather, by = "date") %>%
+  mutate(
+    rain_cat = cut(rain_3day, breaks = c(-Inf, 0.5, 10, 30, Inf),
+                   labels = c("Dry (0 mm)", "Light (1-10)", "Moderate (10-30)", "Heavy (30+)")),
+    days_cat     = bin_days(days_since_heavy),
+    weather_type = if_else(rain_3day < DRY_LIMIT, "Dry weather", "Wet weather")
+  )
+
+# Coastal subset (ocean + harbour only) used for most comparisons
+coastal <- beach %>%
+  filter(site_type != "River/lake") %>%
+  droplevels()
+
+stopifnot(nrow(beach) == nrow(water))   # the join should not add or drop rows
+
+cat("Final dataset:", comma(nrow(beach)), "samples from", n_distinct(beach$swim_site),
+    "swim sites,", min(beach$year), "to", max(beach$year), "\n")
+```
+
+# 4. Overview
+
+```{r overview-table}
+beach %>%
+  group_by(`Site type` = site_type) %>%
+  summarise(Sites             = n_distinct(swim_site),
+            Samples           = n(),
+            `% unsafe`        = percent(mean(unsafe), accuracy = 0.1),
+            `Median bacteria` = median(enterococci_cfu_100ml)) %>%
+  kable(caption = "Overview by site type", format.args = list(big.mark = ","))
+```
+
+```{r distribution}
+ggplot(beach, aes(enterococci_cfu_100ml + 1)) +
+  geom_histogram(bins = 50, fill = "#0E7C86") +
+  geom_vline(xintercept = SAFE_LIMIT, color = "#E4572E", linewidth = 1, linetype = "dashed") +
+  scale_x_log10(labels = comma) +
+  labs(title = "Most samples are clean, with a long tail of high counts",
+       subtitle = "Dashed red line = safe limit (41 cfu)",
+       x = "Enterococci (cfu/100 mL, log scale)", y = "Number of samples")
+```
+
+**What we're seeing:**
+
+- **About 1 in 7 samples (`r percent(mean(beach$unsafe), accuracy = 0.1)`) is unsafe.**
+- **The typical sample is very clean.** The median is only `r median(beach$enterococci_cfu_100ml)` cfu, while the histogram's long right tail shows the unsafe samples come in occasional spikes.
+
+---
+
+# 5. Question 1: Where is the water unsafe?
+
+## Figure 1: Unsafe rate by site type
+
+```{r fig1}
+fig1_data <- beach %>% unsafe_summary(site_type)
+
+ggplot(fig1_data, aes(site_type, pct_unsafe, fill = site_type)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_text(aes(label = percent(pct_unsafe, accuracy = 1)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Harbour water is unsafe more often than ocean water",
+       x = NULL, y = "% of samples over the safe limit")
+```
+
+**What this graph shows:** the percent of samples over the safe limit for each site type.
+
+**What we're seeing:**
+
+- **Ocean vs. harbour:** harbour sites are unsafe **18%** of the time vs. **13%** at ocean beaches, about **1.4 times as often**.
+- **River/lake sites are by far the worst at 60%.**
+- **Is the gap real or luck?** We test that in the next section.
+
+## Is the harbour difference statistically real?
+
+```{r q1-tests}
+# Count table: rows = site type, columns = safe (FALSE) / unsafe (TRUE)
+q1_table <- table(coastal$site_type, coastal$unsafe)
+q1_table
+
+chisq.test(q1_table)
+
+# Two-proportion test: gives a confidence interval for the gap between the two percentages
+q1_counts <- coastal %>% unsafe_summary(site_type)   # one row for Ocean, one for Harbour
+prop.test(x = q1_counts$n_unsafe, n = q1_counts$samples)
+```
+
+**Reading the tests:**
+
+- **Chi-square test:** the p-value is far below 0.05, so the difference between harbour and ocean is not due to chance.
+- **Two-proportion test:** R reports the gap as *ocean minus harbour*, so it shows up as about **−5 percentage points**. In other words, harbour water is unsafe about 5 points more often, and the 95% confidence interval for that gap is narrow because we have tens of thousands of samples.
+
+## Figure 2: Riskiest and cleanest beaches
+
+```{r fig2, fig.height=7}
+# One row per site; only sites with at least 100 samples
+site_summary <- beach %>%
+  unsafe_summary(swim_site, site_type, latitude, longitude) %>%
+  filter(samples >= 100)
+
+site_summary %>%
+  slice_max(pct_unsafe, n = 15) %>%
+  ggplot(aes(pct_unsafe, reorder(swim_site, pct_unsafe), fill = site_type)) +
+  geom_col() +
+  geom_text(aes(label = percent(pct_unsafe, accuracy = 1)), hjust = -0.15, size = 3.5) +
+  scale_fill_manual(values = type_colors) +
+  scale_x_continuous(labels = percent, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "The 15 swim sites most often over the safe limit",
+       subtitle = "Sites with at least 100 samples",
+       x = "% of samples over the safe limit", y = NULL, fill = "Site type")
+```
+
+**What we're seeing:**
+
+- **Inland sites dominate the top of the list.** Megalong Creek is unsafe **85%** of the time.
+- **The worst coastal sites** are **Darling Harbour (45%)** and **Boat Harbour (38%)**.
+- **The other coastal sites near the top** are harbour coves and small protected inlets, where the water sits still.
+
+```{r fig2b, fig.height=6}
+site_summary %>%
+  slice_min(pct_unsafe, n = 15, with_ties = FALSE) %>%
+  ggplot(aes(pct_unsafe, reorder(swim_site, -pct_unsafe), fill = site_type)) +
+  geom_col() +
+  geom_text(aes(label = percent(pct_unsafe, accuracy = 0.1)), hjust = -0.15, size = 3.5) +
+  scale_fill_manual(values = type_colors) +
+  scale_x_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "The 15 cleanest swim sites",
+       x = "% of samples over the safe limit", y = NULL, fill = "Site type")
+```
+
+**What we're seeing:**
+
+- **The cleanest sites are almost all exposed surf beaches in Northern Sydney.** Avalon Beach is unsafe only **3%** of the time.
+- **Waves and open water flush pollution away quickly.** This is the mirror image of the riskiest list.
+
+## Map of coastal sites
+
+```{r map, fig.height=7}
+site_summary %>%
+  filter(site_type != "River/lake") %>%
+  ggplot(aes(longitude, latitude, color = pct_unsafe, shape = site_type)) +
+  geom_point(size = 4) +
+  scale_color_gradient(low = "#0E7C86", high = "#E4572E", labels = percent) +
+  coord_quickmap() +                                  # keeps the map from looking stretched
+  labs(title = "Coastal swim sites colored by % unsafe",
+       x = "Longitude", y = "Latitude", color = "% unsafe", shape = "Site type")
+```
+
+**What we're seeing:**
+
+- **North:** the Northern Beaches, the line of circles along the coast, are mostly teal (clean).
+- **Harbour:** the triangles are mixed, with several orange sites.
+- **South:** a few orange ocean sites appear in the Southern Sydney inlets.
+
+## Region and council summaries
+
+```{r region-council}
+beach %>%
+  unsafe_summary(region, site_type) %>%
+  arrange(desc(pct_unsafe)) %>%
+  transmute(Region = region, `Site type` = site_type, Samples = samples,
+            `% unsafe` = percent(pct_unsafe, accuracy = 0.1), `Median bacteria` = median_bac) %>%
+  kable(caption = "Unsafe rate by region", format.args = list(big.mark = ","))
+
+beach %>%
+  unsafe_summary(council) %>%
+  ggplot(aes(pct_unsafe, reorder(council, pct_unsafe))) +
+  geom_col(fill = "#0E7C86") +
+  scale_x_continuous(labels = percent) +
+  labs(title = "Unsafe rate by local council",
+       x = "% of samples over the safe limit", y = NULL)
+```
+
+**What we're seeing:**
+
+- **Northern Sydney is the cleanest region.** It's unsafe less than 10% of the time.
+- **Inland councils have the highest rates:** Hawkesbury and Blue Mountains.
+- **Among coastal councils,** the City of Sydney is the worst. Its sites, such as Darling Harbour, are in the most built-up part of the city.
+
+## Bacteria levels by site type
+
+```{r boxplot-type}
+ggplot(beach, aes(site_type, enterococci_cfu_100ml + 1, fill = site_type)) +
+  geom_boxplot(outlier.alpha = 0.05, show.legend = FALSE) +
+  geom_hline(yintercept = SAFE_LIMIT, color = "#E4572E", linetype = "dashed") +
+  scale_y_log10(labels = comma) +
+  scale_fill_manual(values = type_colors) +
+  labs(title = "Bacteria levels by site type (log scale)",
+       subtitle = "Dashed red line = safe limit",
+       x = NULL, y = "Enterococci (cfu/100 mL + 1)")
+```
+
+**What we're seeing:**
+
+- **The middle line of each box** is the median. For ocean and harbour sites it's well below the dashed safe limit.
+- **The harbour box stretches higher,** meaning it has more frequent high readings.
+- **River/lake sites:** the whole box sits around the limit.
+
+---
+
+# 6. Question 2: How fast does water recover after heavy rain?
+
+## Rain makes everything worse
+
+```{r rain-cat}
+beach %>%
+  filter(!is.na(rain_cat)) %>%
+  unsafe_summary(rain_cat, site_type) %>%
+  ggplot(aes(rain_cat, pct_unsafe, fill = site_type)) +
+  geom_col(position = "dodge") +                    # bars side by side, not stacked
+  scale_fill_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "The more it rains, the more often water is unsafe",
+       x = "Rain in the previous 3 days", y = "% of samples over the safe limit",
+       fill = "Site type")
+```
+
+**What we're seeing:**
+
+- **Every site type climbs as rain increases.** Ocean beaches go from under 10% unsafe on dry days to about 40% after heavy rain.
+- **Harbour sites climb even faster,** to over 60%.
+- **Why:** rain washes sewage overflows, animal waste, and street runoff into the water.
+
+## Figure 3: The recovery curve
+
+```{r fig3}
+recovery <- beach %>%
+  filter(!is.na(days_cat)) %>%
+  unsafe_summary(days_cat, site_type)
+
+ggplot(recovery, aes(days_cat, pct_unsafe, color = site_type, group = site_type)) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 3) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "How long after heavy rain until the water is safe again?",
+       x = "Days since the last heavy rain day (20+ mm)",
+       y = "% of samples over the safe limit", color = "Site type")
+```
+
+**What this graph shows:** this is the key graph for Question 2. Each sample is placed by how many days had passed since the last heavy rain. The far right ("15+") is normal conditions.
+
+**What we're seeing:**
+
+- **The peak is the day *after* the rain.** Runoff takes time to reach the beach.
+- **Ocean beaches (teal) recover fast.** They peak at **46%**, drop to **24%** by day 2, and are back near normal (about 12%) by days 4–7.
+- **Harbour sites (orange) recover slowly.** They peak at **73%**, are still at **65%** on day 2, and stay above 30% through day 4 before returning to normal after 5–7 days.
+- **River/lake sites never recover to safe levels.**
+
+## Table 1: Days until back to normal, by region
+
+```{r table1}
+# Step 1: each region's "normal" unsafe rate = 15+ days after any heavy rain
+normal_rates <- beach %>%
+  filter(days_since_heavy >= 15) %>%
+  group_by(region) %>%
+  summarise(normal = mean(unsafe))
+
+# Step 2: unsafe rate on each day from 1 to 14 days after heavy rain
+by_day <- beach %>%
+  filter(days_since_heavy >= 1, days_since_heavy <= 14) %>%
+  group_by(region, days_since_heavy) %>%
+  summarise(pct_unsafe = mean(unsafe), .groups = "drop") %>%
+  left_join(normal_rates, by = "region")
+
+# Step 3: for each region, the peak and the first day within 5 points of normal
+table1 <- by_day %>%
+  group_by(region) %>%
+  summarise(
+    peak           = max(pct_unsafe),
+    normal         = first(normal),
+    back_to_normal = min(days_since_heavy[pct_unsafe <= normal + 0.05])
+  ) %>%
+  arrange(back_to_normal)
+
+table1 %>%
+  transmute(Region = region,
+            `Peak % unsafe after rain`  = percent(peak, accuracy = 1),
+            `Normal % unsafe`           = percent(normal, accuracy = 1),
+            `Days until back to normal` = back_to_normal) %>%
+  kable(caption = "Table 1: Recovery after heavy rain by region")
+```
+
+**What this table shows:** for each region, it lists three numbers:
+
+- **the worst unsafe rate after heavy rain;**
+- **its normal unsafe rate;**
+- **the first day it gets back to within 5 percentage points of normal.**
+
+**What we're seeing:**
+
+- **Recovery times:** Northern and Southern Sydney recover in about **4 days**, while Sydney City and Sydney Harbour take about **5**.
+- **Peak height:** the harbour's peak is much higher, so it has further to fall.
+
+## Recovery curves for each region
+
+```{r recovery-region, fig.height=6}
+beach %>%
+  filter(!is.na(days_cat)) %>%
+  unsafe_summary(days_cat, region) %>%
+  ggplot(aes(days_cat, pct_unsafe, group = region)) +
+  geom_line(color = "#0B2545", linewidth = 1) +
+  geom_point(color = "#0B2545") +
+  facet_wrap(~ region) +                            # one small panel per region
+  scale_y_continuous(labels = percent) +
+  labs(title = "Recovery after heavy rain, by region",
+       x = "Days since heavy rain", y = "% of samples over the safe limit") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**What we're seeing:** every region follows the same shape (a spike right after rain, then a decline), but the height and length of the spike differ. Sydney Harbour and Sydney City have the tallest spikes of the coastal regions.
+
+## Does our definition of "heavy rain" change the answer?
+
+We picked 20 mm as "heavy rain," but that's a choice. Here we redo the recovery curve with 10 mm and 40 mm to check that our conclusion holds up. This is called a **sensitivity analysis**.
+
+```{r sensitivity, fig.height=6}
+# Make three copies of the coastal data, each binned with a different rain cutoff, then stack them
+sensitivity <- bind_rows(
+  coastal %>% mutate(days_cat = bin_days(days_since_10mm),  cutoff = "10+ mm"),
+  coastal %>% mutate(days_cat = bin_days(days_since_heavy), cutoff = "20+ mm (ours)"),
+  coastal %>% mutate(days_cat = bin_days(days_since_40mm),  cutoff = "40+ mm")
+) %>%
+  filter(!is.na(days_cat)) %>%
+  unsafe_summary(cutoff, days_cat, site_type)
+
+ggplot(sensitivity, aes(days_cat, pct_unsafe, color = site_type, group = site_type)) +
+  geom_line(linewidth = 1.1) +
+  geom_point() +
+  facet_wrap(~ cutoff) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Recovery curves using three different heavy-rain cutoffs",
+       x = "Days since rain", y = "% unsafe", color = "Site type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**What we're seeing:**
+
+- **Bigger storms make bigger spikes:** the 40 mm panel has the tallest peaks.
+- **The pattern itself never changes:** whatever cutoff we use, the harbour (orange) spikes higher and stays high longer than the ocean (teal).
+- **So our conclusion doesn't depend on the exact 20 mm choice.**
+
+## Figure 4: Rainfall vs. bacteria regression
+
+```{r fig4}
+# We only draw the fitted lines. Plotting all ~100,000 points just makes a solid blob.
+coastal %>%
+  filter(!is.na(rain_3day)) %>%
+  ggplot(aes(rain_3day + 1, log_bacteria, color = site_type)) +
+  geom_smooth(method = "lm", linewidth = 1.6) +
+  geom_hline(yintercept = log10(SAFE_LIMIT + 1), linetype = "dashed") +
+  scale_x_log10() +
+  scale_color_manual(values = type_colors) +
+  labs(title = "Bacteria rise with rain, and more steeply in the harbour",
+       subtitle = "Lines = linear regression fit; dashed line = safe limit",
+       x = "Rain in previous 3 days (mm + 1, log scale)",
+       y = "Bacteria level (log10 cfu + 1)", color = "Site type")
+```
+
+```{r q2-regression}
+# The * means: a separate rain slope for each site type (an "interaction")
+lm_rain <- lm(log_bacteria ~ log10(rain_3day + 1) * site_type, data = coastal)
+
+tidy(lm_rain, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 3))) %>%
+  kable(caption = "Linear regression: log bacteria ~ log rain x site type")
+
+glance(lm_rain) %>%
+  select(r.squared, adj.r.squared, nobs) %>%
+  kable(digits = 3)
+
+# Turn the slopes into "how many times more bacteria if rain goes up 10x"
+b <- coef(lm_rain)
+ocean_slope   <- b["log10(rain_3day + 1)"]
+harbour_slope <- b["log10(rain_3day + 1)"] + b["log10(rain_3day + 1):site_typeHarbour"]
+
+tibble(`Site type` = c("Ocean", "Harbour"),
+       Slope       = round(c(ocean_slope, harbour_slope), 2),
+       `Bacteria multiplier when rain goes up 10x` = round(10^c(ocean_slope, harbour_slope), 1)) %>%
+  kable(caption = "What the slopes mean")
+```
+
+**Reading the regression:**
+
+- **The slopes, in plain terms:** if rain goes up 10 times, bacteria go up about **2.4 times at ocean beaches** but about **5.7 times in the harbour**.
+- **The interaction term** (rain × harbour) tests whether that difference is real. Its p-value is essentially 0, so it is.
+- **R² is about 0.13,** meaning rain explains part of the variation but not all of it. Tides, wind, sewage leaks, and location also matter, which is a good point for your Discussion.
+
+## Checking the regression
+
+```{r diagnostics, fig.height=4}
+# augment() adds fitted values and residuals; we plot a random 5,000 so it draws quickly
+diag_data <- augment(lm_rain) %>% slice_sample(n = 5000)
+
+ggplot(diag_data, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.15) +
+  geom_hline(yintercept = 0, color = "#E4572E") +
+  labs(title = "Residuals vs. fitted", x = "Fitted value", y = "Residual")
+
+ggplot(diag_data, aes(sample = .resid)) +
+  stat_qq(alpha = 0.2) +
+  stat_qq_line(color = "#E4572E") +
+  labs(title = "Normal Q-Q plot of residuals", x = "Theoretical", y = "Sample")
+```
+
+**What we're seeing:**
+
+- **The residuals form bands**, because bacteria counts are whole numbers reported at set levels, and **the Q-Q plot bends at the ends**.
+- **So the linear model isn't perfect.** That's why we also fit a **logistic regression** below, which models the safe/unsafe outcome directly.
+
+## Logistic regression: chance of unsafe water
+
+```{r q2-logistic}
+logit_q2 <- glm(unsafe ~ log10(rain_3day + 1) + site_type + season,
+                data = beach, family = binomial)
+
+odds_table(logit_q2) %>%
+  kable(caption = "Logistic regression odds ratios")
+
+# Predicted chance of unsafe water in summer, for 0-80 mm of rain, ocean vs. harbour
+pred_q2 <- tibble(rain_3day = rep(0:80, times = 2),
+                  site_type = rep(c("Ocean", "Harbour"), each = 81),
+                  season    = "Summer")
+pred_q2$prob <- predict(logit_q2, newdata = pred_q2, type = "response")
+
+ggplot(pred_q2, aes(rain_3day, prob, color = site_type)) +
+  geom_line(linewidth = 1.5) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.7)) +
+  labs(title = "Predicted chance a summer sample is unsafe",
+       x = "Rain in previous 3 days (mm)", y = "Predicted chance unsafe",
+       color = "Site type")
+```
+
+**What we're seeing:**
+
+- **Rain:** risk rises quickly over the first 10–20 mm, then levels off.
+- **Harbour:** even after accounting for rain and season, harbour samples have about **1.45 times the odds** of being unsafe compared with ocean samples.
+- **Season:** spring has the lowest risk; summer and autumn have the highest.
+
+---
+
+# 7. Question 3: Is water quality getting better?
+
+## Figure 5a: Unsafe rate by year
+
+```{r fig5a}
+yearly <- coastal %>%
+  filter(year < 2025) %>%                    # 2025 is a partial year
+  unsafe_summary(year, site_type) %>%
+  filter(samples >= 50)                      # skip years with very few samples
+
+ggplot(yearly, aes(year, pct_unsafe, color = site_type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Unsafe rate each year, ocean vs. harbour",
+       x = NULL, y = "% of samples over the safe limit", color = "Site type")
+```
+
+**What this graph shows:** the percent of samples that were unsafe in each year, for ocean and harbour sites.
+
+**What we're seeing:**
+
+- **A big drop around 2000.** In the 1990s, about 20–30% of samples were unsafe. After about 2000, this falls to around 9% at ocean beaches and 13% in the harbour.
+  - Sydney carried out major sewage upgrades around this time. That's worth researching for your Discussion, but our data alone can't prove the cause.
+- **Stable for about 15 years,** then **an uptick in the early 2020s,** especially in the harbour.
+
+## Table 2: Unsafe rate by 5-year period
+
+```{r table2}
+# Unsafe rate per period, with ocean and harbour as side-by-side columns
+table2 <- coastal %>%
+  unsafe_summary(period, site_type) %>%
+  select(period, site_type, pct_unsafe) %>%
+  pivot_wider(names_from = site_type, values_from = pct_unsafe)
+
+# Average rain per year in each period (built from the yearly_rain table)
+rain_by_period <- yearly_rain %>%
+  mutate(period = cut(year, breaks = PERIOD_BREAKS, labels = PERIOD_LABELS)) %>%
+  group_by(period) %>%
+  summarise(avg_rain = mean(total_rain), heavy_days = mean(heavy_days))
+
+table2 %>%
+  left_join(rain_by_period, by = "period") %>%
+  transmute(Period                     = period,
+            `Ocean % unsafe`           = percent(Ocean, accuracy = 0.1),
+            `Harbour % unsafe`         = percent(Harbour, accuracy = 0.1),
+            `Avg rain per year (mm)`   = round(avg_rain),
+            `Heavy rain days per year` = round(heavy_days, 1)) %>%
+  kable(caption = "Table 2: Unsafe rate and rainfall by 5-year period")
+```
+
+**What this table shows:** the unsafe rate for each 5-year period, next to how much it rained in that period.
+
+**What we're seeing:**
+
+- **1990s vs. 2000s:** unsafe rates fall from over 20% in the 1990s to about 9% (ocean) and 13% (harbour) from 2001 onward.
+- **2021–25 creeps back up** to about 11% (ocean) and 18% (harbour).
+- **But 2021–25 was also by far the wettest period**, with the most rain and the most heavy rain days.
+- **So we need to separate the effect of weather from the effect of time,** which the next graph does.
+
+## Figure 5: Wet vs. dry weather over time
+
+```{r fig5, fig.height=6}
+coastal %>%
+  filter(!is.na(weather_type)) %>%
+  unsafe_summary(period, site_type, weather_type) %>%
+  ggplot(aes(period, pct_unsafe, color = weather_type, group = weather_type)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ site_type) +
+  scale_color_manual(values = weather_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Water quality over time in dry vs. wet weather",
+       subtitle = "Dry = under 1 mm of rain in the previous 3 days",
+       x = NULL, y = "% of samples over the safe limit", color = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**What this graph shows:** samples are split into dry weather (yellow) and wet weather (navy), and the unsafe rate is tracked over time for each.
+
+**What we're seeing:**
+
+- **Dry weather:** the yellow line drops sharply around 2000 and then stays very low (about 4–5%) for both ocean and harbour.
+  - On a dry day, Sydney's beaches are much cleaner than they were in the 1990s.
+- **Wet weather:** the navy line is always higher and bounces around more, because it depends on how much it rained.
+- **The 2021–25 uptick is mostly a wet-weather effect.** Ocean dry-weather rates stayed at about 4%.
+- **The exception is the harbour,** where dry-weather rates rose to about 8%. That's worth watching.
+- **What that suggests:** the progress since 2000 is mostly holding, and the recent rise is largely explained by wetter years.
+
+## Rainfall vs. unsafe rate, year by year
+
+```{r rain-vs-year, fig.height=6}
+yearly %>%
+  left_join(yearly_rain, by = "year") %>%
+  mutate(era = if_else(year <= 2000, "1991-2000", "2001-2024")) %>%
+  ggplot(aes(total_rain, pct_unsafe, color = era)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ site_type) +
+  scale_color_manual(values = c("1991-2000" = "#E4572E", "2001-2024" = "#0E7C86")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Wetter years have more unsafe water",
+       subtitle = "But the 1990s (orange) were worse even at similar rainfall",
+       x = "Total rain that year (mm)", y = "% of samples unsafe", color = "Era")
+```
+
+**What this graph shows:** each dot is one year, placed by how much it rained (x-axis) and how often the water was unsafe (y-axis).
+
+**What we're seeing:**
+
+- **Within each era, wetter years have more unsafe water.** Both lines slope up.
+- **The orange 1990s dots sit well above the teal post-2000 dots,** even at similar rainfall. So the 1990s were dirtier for reasons other than weather.
+- **The recent wet years sit at the right end of the teal line.** They're high because of the rain, not because the water got worse overall.
+
+## Same sites only: a fair comparison over time
+
+Some sites were only added later, which could distort the trend. Here we keep only sites sampled in **both** 1996–2000 **and** 2021–2025.
+
+```{r same-sites}
+# Find sites that show up in both periods
+sites_1990s <- coastal %>% filter(period == "1996-00") %>% pull(swim_site) %>% unique()
+sites_2020s <- coastal %>% filter(period == "2021-25") %>% pull(swim_site) %>% unique()
+consistent_sites <- intersect(sites_1990s, sites_2020s)
+
+cat("Sites sampled in both periods:", length(consistent_sites), "\n")
+
+coastal %>%
+  filter(swim_site %in% consistent_sites) %>%
+  unsafe_summary(period, site_type) %>%
+  ggplot(aes(period, pct_unsafe, color = site_type, group = site_type)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Trend using only sites sampled in both the late 1990s and 2020s",
+       x = NULL, y = "% of samples over the safe limit", color = "Site type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**What we're seeing:** the same pattern appears, with a big drop around 2000 and a smaller rise in 2021–25. So the trend isn't just caused by which sites happened to be sampled.
+
+## Logistic model: time trend after accounting for rain
+
+```{r q3-model}
+# decade * site_type = a separate time trend for ocean and harbour
+logit_q3 <- glm(unsafe ~ decade * site_type + log10(rain_3day + 1) + season,
+                data = coastal, family = binomial)
+
+odds_table(logit_q3) %>%
+  kable(caption = "Logistic regression: unsafe ~ decade x site type + rain + season")
+
+# Same model using only 2001 onward (after the big early-2000s drop)
+logit_q3_post <- glm(unsafe ~ decade * site_type + log10(rain_3day + 1) + season,
+                     data = filter(coastal, year >= 2001), family = binomial)
+
+odds_table(logit_q3_post) %>%
+  filter(str_detect(Term, "decade")) %>%
+  kable(caption = "Same model using only 2001 onward")
+```
+
+**Reading the model:**
+
+- **Odds ratio for `decade`:** this is the change in the odds of unsafe water per 10 years, **holding rain and season constant**. A number below 1 means the water is getting cleaner.
+- **Full record:** the decade odds ratio is well below 1, showing a strong improvement since the 1990s that rain doesn't explain.
+- **2001 onward only:** the decade odds ratio is about **0.86**, still below 1. Once the big early-2000s drop is excluded and rain is accounted for, water quality has **kept improving slowly**: the odds of unsafe water fall about 14% per decade.
+- **What this means:** the 2021–25 uptick is a weather effect, not a reversal of progress.
+
+```{r q3-predicted}
+# Predicted chance of unsafe water each year on a dry summer day
+pred_q3 <- tibble(year      = rep(1992:2024, times = 2),
+                  site_type = rep(c("Ocean", "Harbour"), each = 33),
+                  rain_3day = 0,
+                  season    = "Summer") %>%
+  mutate(decade = (year - 2000) / 10)
+pred_q3$prob <- predict(logit_q3, newdata = pred_q3, type = "response")
+
+ggplot(pred_q3, aes(year, prob, color = site_type)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Model-predicted chance of unsafe water over time",
+       subtitle = "Dry summer day (rain held at 0 mm)",
+       x = NULL, y = "Predicted chance unsafe", color = "Site type")
+```
+
+**What we're seeing:**
+
+- **With rain held fixed, the predicted risk falls steadily over time** for both ocean and harbour sites.
+- **Because rain is held at zero,** the recent wet years can't push the line up. That's how the model separates the time trend from the weather.
+
+---
+
+# 8. Extra comparisons
+
+## Season
+
+```{r season}
+beach %>%
+  unsafe_summary(season, site_type) %>%
+  ggplot(aes(season, pct_unsafe, fill = site_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Unsafe rate by season", x = NULL, y = "% of samples over the safe limit",
+       fill = "Site type")
+```
+
+**What we're seeing:** summer and autumn are the worst seasons, which is also when the most people swim.
+
+## Month × region heat map
+
+```{r heatmap}
+beach %>%
+  unsafe_summary(region, month) %>%
+  ggplot(aes(month, region, fill = pct_unsafe)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(pct_unsafe, accuracy = 1)), size = 3) +
+  scale_fill_gradient(low = "#E6F2F2", high = "#E4572E", labels = percent) +
+  labs(title = "When and where is the water worst?", x = NULL, y = NULL, fill = "% unsafe")
+```
+
+**What we're seeing:** darker cells are worse. Northern Sydney stays light all year, while Western Sydney is dark nearly every month.
+
+## Water temperature
+
+```{r temperature}
+beach %>%
+  filter(!is.na(water_temperature_c), site_type != "River/lake") %>%
+  mutate(temp_bin = cut_width(water_temperature_c, 2)) %>%   # 2-degree bins
+  unsafe_summary(temp_bin, site_type) %>%
+  filter(samples >= 50) %>%
+  ggplot(aes(temp_bin, pct_unsafe, color = site_type, group = site_type)) +
+  geom_line(linewidth = 1.1) +
+  geom_point() +
+  scale_color_manual(values = type_colors) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Unsafe rate by water temperature",
+       x = "Water temperature (°C)", y = "% unsafe", color = "Site type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**What we're seeing:**
+
+- **No consistent pattern.** Ocean sites are worst at the coldest and warmest readings, while harbour sites get slightly cleaner as the water warms.
+- **Why we don't draw conclusions from it:** temperature is missing in most samples, and the extreme temperature bins have few samples.
+
+---
+
+# 9. Summary of findings
+
+```{r summary-numbers}
+overall_pct <- percent(mean(beach$unsafe), accuracy = 0.1)
+type_pct    <- beach %>% unsafe_summary(site_type)    # one row per site type
+day1        <- recovery %>% filter(days_cat == "1")   # the day after heavy rain
+
+ocean_pct    <- percent(type_pct$pct_unsafe[type_pct$site_type == "Ocean"],      accuracy = 1)
+harbour_pct  <- percent(type_pct$pct_unsafe[type_pct$site_type == "Harbour"],    accuracy = 1)
+river_pct    <- percent(type_pct$pct_unsafe[type_pct$site_type == "River/lake"], accuracy = 1)
+ocean_peak   <- percent(day1$pct_unsafe[day1$site_type == "Ocean"],   accuracy = 1)
+harbour_peak <- percent(day1$pct_unsafe[day1$site_type == "Harbour"], accuracy = 1)
+```
+
+| Question | Answer |
+|---|---|
+| **Q1. Where is it unsafe?** | Overall `r overall_pct` of samples are unsafe. River/lake sites are worst (`r river_pct`), then harbour (`r harbour_pct`), then ocean (`r ocean_pct`). Darling Harbour and Boat Harbour are the worst coastal sites; the Northern Beaches are the cleanest. |
+| **Q2. How fast does it recover?** | The day after heavy rain, `r harbour_peak` of harbour samples and `r ocean_peak` of ocean samples are unsafe. Ocean beaches halve their risk within 2 days and return to normal in about 4; the harbour takes about 5. Rain raises harbour bacteria about twice as steeply. |
+| **Q3. Is it getting better?** | Yes. Unsafe rates dropped sharply around 2000 and dry-weather water is now much cleaner than in the 1990s. The 2021–25 uptick lines up with the wettest years on record and is mostly a wet-weather effect. |
+
+**Limitations for the Discussion section:**
+
+- **Weather data:** one weather station represents all of Sydney.
+- **Uneven sampling:** harbour sites are sampled less often in winter, and the set of sites changed over time. We checked the time trend using only consistent sites.
+- **Association, not proof:** we can show rain and time are linked to unsafe water, but not prove what caused the improvement around 2000.
+- **Missing data:** water temperature is missing in most samples.
+
+```{r session}
+sessionInfo()
+```
+
